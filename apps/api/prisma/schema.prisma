@@ -1,0 +1,26 @@
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Repository {
+  id            String   @id @default(uuid())
+  githubId      BigInt   @unique
+  name          String
+  fullName      String
+  description   String?
+  url           String   @unique
+  language      String?
+  stars         Int      @default(0)
+  forks         Int      @default(0)
+  defaultBranch String
+  isPrivate     Boolean  @default(false)
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}

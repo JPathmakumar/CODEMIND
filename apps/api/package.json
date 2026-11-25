@@ -1,0 +1,27 @@
+{
+  "name": "@codemind/api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js"
+  },
+  "devDependencies": {
+    "@types/babel__traverse": "^7.28.0",
+    "@types/pg": "^8.23.1",
+    "@types/yauzl": "^3.4.0",
+    "prisma": "^7.10.0",
+    "tsx": "^4.23.15"
+  },
+  "dependencies": {
+    "@babel/parser": "^7.29.15",
+    "@babel/traverse": "^7.29.15",
+    "@prisma/adapter-pg": "^7.10.1",
+    "@prisma/client": "^7.10.0",
+    "octokit": "^5.0.5",
+    "pg": "^8.23.1",
+    "yauzl": "^3.4.0"
+  }
+}
