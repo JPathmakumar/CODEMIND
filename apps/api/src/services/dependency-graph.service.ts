@@ -29,10 +29,17 @@ export interface UnresolvedGraphImport {
   reason: string | null;
 }
 
+export interface ExternalGraphImport {
+  importerPath: string;
+  source: string;
+  reason: string | null;
+}
+
 export interface DependencyGraphStatistics {
   totalFiles: number;
   totalEdges: number;
   unresolvedImports: number;
+  externalImports: number;
   analysisErrors: number;
   mostImportedFiles: Array<{
     path: string;
@@ -49,6 +56,7 @@ export interface DependencyGraphResult {
   nodes: DependencyGraphNode[];
   edges: DependencyGraphEdge[];
   unresolved: UnresolvedGraphImport[];
+  externalDependencies: ExternalGraphImport[];
   statistics: DependencyGraphStatistics;
   truncated: boolean;
 }
@@ -324,6 +332,7 @@ export async function generateDependencyGraph(
 
   const edges: DependencyGraphEdge[] = [];
   const unresolved: UnresolvedGraphImport[] = [];
+  const externalDependencies: ExternalGraphImport[] = [];
 
   let analysisErrors = 0;
   let nextFileIndex = 0;
@@ -363,8 +372,20 @@ export async function generateDependencyGraph(
         let edgeNumber = 0;
 
         for (const dependency of dependencyAnalysis.dependencies) {
+          // Record external packages separately.
+          if (dependency.type === "external") {
+            externalDependencies.push({
+              importerPath: file.path,
+              source: dependency.source,
+              reason: dependency.reason,
+            });
+
+            continue;
+          }
+
+          // Record genuinely unresolved dependencies.
           if (
-            dependency.type !== "resolved" ||
+            dependency.type === "unresolved" ||
             !dependency.resolvedPath
           ) {
             unresolved.push({
@@ -471,15 +492,23 @@ export async function generateDependencyGraph(
       a.source.localeCompare(b.source)
   );
 
+  externalDependencies.sort(
+    (a, b) =>
+      a.source.localeCompare(b.source) ||
+      a.importerPath.localeCompare(b.importerPath)
+  );
+
   return {
     repositoryId,
     nodes: sortedNodes,
     edges,
     unresolved,
+    externalDependencies,
     statistics: {
       totalFiles: sortedNodes.length,
       totalEdges: edges.length,
       unresolvedImports: unresolved.length,
+      externalImports: externalDependencies.length,
       analysisErrors,
       mostImportedFiles,
       filesWithMostImports,

@@ -1,4 +1,5 @@
 
+import { builtinModules } from "node:module";
 import path from "node:path";
 import fs from "node:fs/promises";
 
@@ -6,7 +7,7 @@ import type { ImportInfo } from "./import-analysis.service.js";
 
 export interface DependencyResult {
   source: string;
-  type: "resolved" | "unresolved";
+  type: "resolved" | "external" | "unresolved";
   resolvedPath: string | null;
   reason: string | null;
 }
@@ -23,6 +24,35 @@ interface RepositoryAlias {
   pattern: string;
   target: string;
 }
+
+interface WorkspacePackage {
+  name: string;
+  directory: string;
+  entryPoints: string[];
+}
+
+const MAX_PACKAGE_MANIFEST_SIZE = 1024 * 1024;
+const MAX_WORKSPACE_SCAN_DIRECTORIES = 20000;
+
+const EXCLUDED_WORKSPACE_DIRECTORIES = new Set([
+  "node_modules",
+  ".git",
+  ".next",
+  ".nuxt",
+  ".cache",
+  ".turbo",
+  "dist",
+  "build",
+  "coverage",
+  "vendor",
+]);
+
+const NODE_BUILTINS = new Set(
+  builtinModules.flatMap((name) => [
+    name,
+    name.startsWith("node:") ? name.slice(5) : `node:${name}`,
+  ])
+);
 
 const SUPPORTED_EXTENSIONS = [
   ".js",
@@ -44,6 +74,292 @@ function isInsideDirectory(
     relative === "" ||
     (!relative.startsWith("..") && !path.isAbsolute(relative))
   );
+}
+
+function isNodeBuiltin(source: string): boolean {
+  return NODE_BUILTINS.has(source);
+}
+
+function getPackageName(source: string): string | null {
+  if (
+    !source ||
+    source.startsWith(".") ||
+    source.startsWith("/") ||
+    source.startsWith("node:")
+  ) {
+    return null;
+  }
+
+  const parts = source.split("/");
+
+  if (source.startsWith("@")) {
+    return parts.length >= 2
+      ? `${parts[0]}/${parts[1]}`
+      : null;
+  }
+
+  return parts[0] ?? null;
+}
+
+function collectEntryPointStrings(value: unknown): string[] {
+  if (typeof value === "string") {
+    return [value];
+  }
+
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value)
+  ) {
+    return [];
+  }
+
+  return Object.values(value).flatMap(collectEntryPointStrings);
+}
+
+/**
+ * Discovers package.json files throughout the repository.
+ *
+ * This also discovers nested package projects that are not listed
+ * in the repository's top-level workspaces configuration.
+ *
+ * Repository configuration is read as data and never executed.
+ */
+async function discoverWorkspacePackages(
+  repositoryRoot: string
+): Promise<Map<string, WorkspacePackage>> {
+  const workspacePackages = new Map<string, WorkspacePackage>();
+  const visitedDirectories = new Set<string>();
+
+  let scannedDirectories = 0;
+
+  async function scanDirectory(directory: string): Promise<void> {
+    if (scannedDirectories >= MAX_WORKSPACE_SCAN_DIRECTORIES) {
+      return;
+    }
+
+    let realDirectory: string;
+
+    try {
+      realDirectory = await fs.realpath(directory);
+    } catch {
+      return;
+    }
+
+    if (
+      !isInsideDirectory(repositoryRoot, realDirectory) ||
+      visitedDirectories.has(realDirectory)
+    ) {
+      return;
+    }
+
+    visitedDirectories.add(realDirectory);
+    scannedDirectories++;
+
+    // Discover a package manifest in this directory.
+    const manifestPath = path.join(realDirectory, "package.json");
+
+    try {
+      const stats = await fs.lstat(manifestPath);
+
+      if (
+        stats.isFile() &&
+        !stats.isSymbolicLink() &&
+        stats.size <= MAX_PACKAGE_MANIFEST_SIZE
+      ) {
+        const parsed: unknown = JSON.parse(
+          await fs.readFile(manifestPath, "utf8")
+        );
+
+        if (
+          parsed !== null &&
+          typeof parsed === "object" &&
+          !Array.isArray(parsed)
+        ) {
+          const manifest = parsed as Record<string, unknown>;
+          const packageName = manifest.name;
+
+          if (
+            typeof packageName === "string" &&
+            packageName.length > 0 &&
+            packageName.length <= 256
+          ) {
+            const entryPoints = [
+              ...collectEntryPointStrings(manifest.exports),
+              ...collectEntryPointStrings(manifest.source),
+              ...collectEntryPointStrings(manifest.module),
+              ...collectEntryPointStrings(manifest.main),
+              ...collectEntryPointStrings(manifest.types),
+              ...collectEntryPointStrings(manifest.typings),
+            ];
+
+            workspacePackages.set(packageName, {
+              name: packageName,
+              directory: realDirectory,
+              entryPoints: [...new Set(entryPoints)],
+            });
+          }
+        }
+      }
+
+      const workspacePackageCache = new Map<
+  string,
+  Promise<Map<string, WorkspacePackage>>
+>();
+
+function getWorkspacePackages(
+  repositoryRoot: string
+): Promise<Map<string, WorkspacePackage>> {
+  const cached = workspacePackageCache.get(repositoryRoot);
+
+  if (cached) {
+    return cached;
+  }
+
+  const discovery = discoverWorkspacePackages(repositoryRoot);
+
+  workspacePackageCache.set(repositoryRoot, discovery);
+
+  return discovery;
+}
+    } catch {
+      // Missing or invalid package manifests are allowed.
+    }
+
+    // Continue scanning child directories.
+    let entries;
+
+    try {
+      entries = await fs.readdir(realDirectory, {
+        withFileTypes: true,
+      });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (
+        !entry.isDirectory() ||
+        entry.isSymbolicLink() ||
+        EXCLUDED_WORKSPACE_DIRECTORIES.has(entry.name)
+      ) {
+        continue;
+      }
+
+      if (scannedDirectories >= MAX_WORKSPACE_SCAN_DIRECTORIES) {
+        break;
+      }
+
+      await scanDirectory(
+        path.join(realDirectory, entry.name)
+      );
+    }
+  }
+
+  await scanDirectory(repositoryRoot);
+
+  return workspacePackages;
+}
+
+const workspacePackageCache = new Map<
+  string,
+  Promise<Map<string, WorkspacePackage>>
+>();
+
+function getWorkspacePackages(
+  repositoryRoot: string
+): Promise<Map<string, WorkspacePackage>> {
+  const cached = workspacePackageCache.get(repositoryRoot);
+
+  if (cached) {
+    return cached;
+  }
+
+  const discovery = discoverWorkspacePackages(repositoryRoot);
+
+  workspacePackageCache.set(repositoryRoot, discovery);
+
+  return discovery;
+}
+
+/**
+ * Discovers packages declared by the importer package and
+ * its parent package manifests.
+ */
+async function discoverDeclaredPackages(
+  repositoryRoot: string,
+  importerRealPath: string
+): Promise<Set<string>> {
+  const packages = new Set<string>();
+
+  let currentDirectory = path.dirname(importerRealPath);
+
+  while (isInsideDirectory(repositoryRoot, currentDirectory)) {
+    const packageJsonPath = path.join(
+      currentDirectory,
+      "package.json"
+    );
+
+    try {
+      const stats = await fs.lstat(packageJsonPath);
+
+      if (
+        stats.isFile() &&
+        !stats.isSymbolicLink() &&
+        stats.size <= MAX_PACKAGE_MANIFEST_SIZE
+      ) {
+        const content = await fs.readFile(
+          packageJsonPath,
+          "utf8"
+        );
+
+        const manifest: unknown = JSON.parse(content);
+
+        if (
+          manifest !== null &&
+          typeof manifest === "object" &&
+          !Array.isArray(manifest)
+        ) {
+          const data = manifest as Record<string, unknown>;
+
+          for (const field of [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+          ]) {
+            const section = data[field];
+
+            if (
+              section !== null &&
+              typeof section === "object" &&
+              !Array.isArray(section)
+            ) {
+              for (const name of Object.keys(section)) {
+                packages.add(name);
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Missing or invalid package manifests are allowed.
+    }
+
+    if (currentDirectory === repositoryRoot) {
+      break;
+    }
+
+    const parentDirectory = path.dirname(currentDirectory);
+
+    if (parentDirectory === currentDirectory) {
+      break;
+    }
+
+    currentDirectory = parentDirectory;
+  }
+
+  return packages;
 }
 
 /**
@@ -69,7 +385,7 @@ async function discoverJestAliases(
       });
 
       for (const entry of entries) {
-        if (!entry.isFile()) {
+        if (!entry.isFile() || entry.isSymbolicLink()) {
           continue;
         }
 
@@ -100,16 +416,15 @@ async function discoverJestAliases(
     try {
       const stats = await fs.lstat(configFile);
 
-      if (!stats.isFile() || stats.isSymbolicLink()) {
+      if (
+        !stats.isFile() ||
+        stats.isSymbolicLink() ||
+        stats.size > MAX_PACKAGE_MANIFEST_SIZE
+      ) {
         continue;
       }
 
       configText = await fs.readFile(configFile, "utf8");
-
-      // Avoid unexpectedly large configuration files.
-      if (configText.length > 1024 * 1024) {
-        continue;
-      }
     } catch {
       continue;
     }
@@ -141,20 +456,17 @@ async function discoverJestAliases(
 }
 
 /**
- * Matches safe, common static Jest patterns:
+ * Matches safe, common static Jest patterns.
  *
+ * Examples:
  * ^shared$
  * ^shared/(.*)$
  * ^shared/([^/]+)$
- *
- * More complex regular expressions are deliberately ignored.
  */
 function matchAlias(
   pattern: string,
   source: string
 ): string | null {
-  // Exact aliases:
-  // ^shared$
   const exactMatch = pattern.match(
     /^\^([A-Za-z0-9_@./-]+)\$$/
   );
@@ -163,9 +475,6 @@ function matchAlias(
     return source === exactMatch[1] ? "" : null;
   }
 
-  // Wildcard aliases:
-  // ^shared/(.*)$
-  // ^shared/([^/]+)$
   const wildcardMatch = pattern.match(
     /^\^([A-Za-z0-9_@./-]+)\/(\(\.\*\)|\(\[\^\/\]\+\))\$$/
   );
@@ -187,12 +496,10 @@ function matchAlias(
     return null;
   }
 
-  // (.*) supports nested paths.
   if (wildcardType === "(.*)") {
     return remainder;
   }
 
-  // ([^/]+) supports only one path segment.
   if (
     wildcardType === "([^/]+)" &&
     remainder.includes("/")
@@ -221,23 +528,21 @@ async function resolveAlias(
       continue;
     }
 
-    // Validate the original alias template before inserting the
-// Windows project path, which may legitimately contain backslashes.
-if (
-  alias.target.includes("\0") ||
-  alias.target.includes("\\") ||
-  alias.target.startsWith("//")
-) {
-  continue;
-}
+    if (
+      alias.target.includes("\0") ||
+      alias.target.includes("\\") ||
+      alias.target.startsWith("//")
+    ) {
+      continue;
+    }
 
-const mappedTarget = alias.target
-  .replace(/<rootDir>/g, repositoryRoot)
-  .replace(/\$1/g, capturedValue);
+    const mappedTarget = alias.target
+      .replace(/<rootDir>/g, repositoryRoot)
+      .replace(/\$1/g, capturedValue);
 
-if (mappedTarget.includes("\0")) {
-  continue;
-}
+    if (mappedTarget.includes("\0")) {
+      continue;
+    }
 
     const candidate = path.isAbsolute(mappedTarget)
       ? path.resolve(mappedTarget)
@@ -288,7 +593,6 @@ async function findExistingFile(
     try {
       const realPath = await fs.realpath(possiblePath);
 
-      // Prevent symlinks from escaping the repository.
       if (!isInsideDirectory(repositoryRoot, realPath)) {
         continue;
       }
@@ -306,6 +610,133 @@ async function findExistingFile(
   return null;
 }
 
+/**
+ * Resolves a workspace package's main entry point.
+ *
+ * Tries declared entry points first, then conventional source files
+ * when compiled output such as dist/index.js is unavailable.
+ */
+async function resolveWorkspacePackage(
+  repositoryRoot: string,
+  workspacePackage: WorkspacePackage
+): Promise<string | null> {
+  for (const entryPoint of workspacePackage.entryPoints) {
+    if (
+      !entryPoint ||
+      entryPoint.includes("\0") ||
+      entryPoint.includes("\\") ||
+      path.isAbsolute(entryPoint) ||
+      entryPoint.split("/").some(
+        (segment) => segment === ".."
+      )
+    ) {
+      continue;
+    }
+
+    const candidate = path.resolve(
+      workspacePackage.directory,
+      entryPoint
+    );
+
+    if (
+      !isInsideDirectory(
+        workspacePackage.directory,
+        candidate
+      )
+    ) {
+      continue;
+    }
+
+    const resolved = await findExistingFile(
+      repositoryRoot,
+      candidate
+    );
+
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  const sourceEntryPoints = [
+    "src/index.ts",
+    "src/index.tsx",
+    "src/index.js",
+    "src/index.jsx",
+    "src/index.mts",
+    "src/index.mjs",
+    "index.ts",
+    "index.tsx",
+    "index.js",
+    "index.jsx",
+  ];
+
+  for (const entryPoint of sourceEntryPoints) {
+    const candidate = path.resolve(
+      workspacePackage.directory,
+      entryPoint
+    );
+
+    const resolved = await findExistingFile(
+      repositoryRoot,
+      candidate
+    );
+
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Resolves a workspace package subpath.
+ *
+ * Example:
+ * react-devtools-shared/src/frontend/types
+ */
+async function resolveWorkspaceSubpath(
+  repositoryRoot: string,
+  workspacePackage: WorkspacePackage,
+  subpath: string
+): Promise<string | null> {
+  const normalizedSubpath = subpath.replace(/^\/+/, "");
+
+  if (
+    !normalizedSubpath ||
+    normalizedSubpath.includes("\0") ||
+    normalizedSubpath.includes("\\") ||
+    normalizedSubpath.split("/").some(
+      (segment) =>
+        segment === ".." || segment === "." || segment === ""
+    )
+  ) {
+    return null;
+  }
+
+  const candidate = path.resolve(
+    workspacePackage.directory,
+    normalizedSubpath
+  );
+
+  if (
+    !isInsideDirectory(
+      workspacePackage.directory,
+      candidate
+    )
+  ) {
+    return null;
+  }
+
+  return findExistingFile(
+    repositoryRoot,
+    candidate
+  );
+}
+
+/**
+ * Finds the actual project root inside the downloaded repository.
+ */
 async function findProjectRoot(
   repositoryRoot: string,
   importerRealPath: string
@@ -324,7 +755,12 @@ async function findProjectRoot(
         jestConfigDirectory
       );
 
-      if (!isInsideDirectory(repositoryRoot, realConfigDirectory)) {
+      if (
+        !isInsideDirectory(
+          repositoryRoot,
+          realConfigDirectory
+        )
+      ) {
         break;
       }
 
@@ -359,8 +795,10 @@ async function findProjectRoot(
  * Supports:
  * - Relative imports
  * - Static Jest aliases
- *
- * External package resolution will be added separately.
+ * - Node.js built-ins
+ * - Declared external packages
+ * - Workspace package entry points
+ * - Workspace package subpaths
  */
 export async function resolveDependencies(
   repositoryRoot: string,
@@ -389,24 +827,43 @@ export async function resolveDependencies(
     ...normalizedImporterPath.split("/")
   );
 
-  if (!isInsideDirectory(realRepositoryRoot, importerAbsolutePath)) {
+  if (
+    !isInsideDirectory(
+      realRepositoryRoot,
+      importerAbsolutePath
+    )
+  ) {
     throw new Error("Importer path is outside the repository.");
   }
 
-  const importerRealPath = await fs.realpath(importerAbsolutePath);
+  const importerRealPath = await fs.realpath(
+    importerAbsolutePath
+  );
 
-  if (!isInsideDirectory(realRepositoryRoot, importerRealPath)) {
+  if (
+    !isInsideDirectory(
+      realRepositoryRoot,
+      importerRealPath
+    )
+  ) {
     throw new Error("Importer file is outside the repository.");
   }
 
-  // Find the actual project root inside the downloaded repository.
-const projectRoot = await findProjectRoot(
-  realRepositoryRoot,
-  importerRealPath
-);
+  const projectRoot = await findProjectRoot(
+    realRepositoryRoot,
+    importerRealPath
+  );
 
-// Discover aliases from the actual project root.
-const aliases = await discoverJestAliases(projectRoot);
+  const aliases = await discoverJestAliases(projectRoot);
+
+  const declaredPackages = await discoverDeclaredPackages(
+    realRepositoryRoot,
+    importerRealPath
+  );
+
+  const workspacePackages = await getWorkspacePackages(
+  realRepositoryRoot
+);
 
   const dependencies: DependencyResult[] = [];
 
@@ -430,6 +887,7 @@ const aliases = await discoverJestAliases(projectRoot);
 
     let candidate: string | null = null;
 
+    // Relative imports.
     if (
       source.startsWith("./") ||
       source.startsWith("../")
@@ -439,7 +897,12 @@ const aliases = await discoverJestAliases(projectRoot);
         source
       );
 
-      if (!isInsideDirectory(realRepositoryRoot, candidate)) {
+      if (
+        !isInsideDirectory(
+          realRepositoryRoot,
+          candidate
+        )
+      ) {
         dependencies.push({
           source,
           type: "unresolved",
@@ -450,24 +913,105 @@ const aliases = await discoverJestAliases(projectRoot);
         continue;
       }
     } else {
-      const resolvedAlias = await resolveAlias(
-  projectRoot,
-  source,
-  aliases
-);
-
-      if (!resolvedAlias) {
+      // Node.js built-in modules.
+      if (isNodeBuiltin(source)) {
         dependencies.push({
           source,
-          type: "unresolved",
+          type: "external",
           resolvedPath: null,
-          reason: "alias-or-external-package-not-resolved",
+          reason: "node-builtin",
         });
 
         continue;
       }
 
-      candidate = resolvedAlias;
+      // Static repository aliases.
+      const resolvedAlias = await resolveAlias(
+        projectRoot,
+        source,
+        aliases
+      );
+
+      if (resolvedAlias) {
+        candidate = resolvedAlias;
+      } else {
+        const packageName = getPackageName(source);
+
+        const workspacePackage = packageName
+          ? workspacePackages.get(packageName)
+          : undefined;
+
+        if (workspacePackage && packageName) {
+          const subpath = source.slice(packageName.length);
+
+          if (subpath.startsWith("/")) {
+            candidate = await resolveWorkspaceSubpath(
+              realRepositoryRoot,
+              workspacePackage,
+              subpath
+            );
+
+            if (!candidate) {
+              dependencies.push({
+                source,
+                type: "unresolved",
+                resolvedPath: null,
+                reason: "workspace-subpath-not-found",
+              });
+
+              continue;
+            }
+          } else {
+            candidate = await resolveWorkspacePackage(
+              realRepositoryRoot,
+              workspacePackage
+            );
+
+            if (!candidate) {
+              dependencies.push({
+                source,
+                type: "unresolved",
+                resolvedPath: null,
+                reason: "workspace-entry-not-found",
+              });
+
+              continue;
+            }
+          }
+        } else if (
+          packageName &&
+          declaredPackages.has(packageName)
+        ) {
+          dependencies.push({
+            source,
+            type: "external",
+            resolvedPath: null,
+            reason: "declared-package",
+          });
+
+          continue;
+        } else {
+          dependencies.push({
+            source,
+            type: "unresolved",
+            resolvedPath: null,
+            reason: "alias-or-package-not-resolved",
+          });
+
+          continue;
+        }
+      }
+    }
+
+    if (!candidate) {
+      dependencies.push({
+        source,
+        type: "unresolved",
+        resolvedPath: null,
+        reason: "file-not-found",
+      });
+
+      continue;
     }
 
     const resolvedFile = await findExistingFile(
@@ -503,12 +1047,15 @@ const aliases = await discoverJestAliases(projectRoot);
     (dependency) => dependency.type === "resolved"
   ).length;
 
+  const unresolvedDependencies = dependencies.filter(
+    (dependency) => dependency.type === "unresolved"
+  ).length;
+
   return {
     fileName: normalizedImporterPath,
     totalDependencies: dependencies.length,
     resolvedDependencies,
-    unresolvedDependencies:
-      dependencies.length - resolvedDependencies,
+    unresolvedDependencies,
     dependencies,
   };
 }

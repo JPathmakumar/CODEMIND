@@ -9,6 +9,7 @@ import { prisma } from "../lib/prisma.js";
 import { analyzeCode } from "../services/code-analysis.service.js";
 import { analyzeImports } from "../services/import-analysis.service.js";
 import { resolveDependencies } from "../services/dependency-resolution.service.js";
+import { generateDependencyGraph } from "../services/dependency-graph.service.js";
 
 const router = Router();
 
@@ -381,6 +382,64 @@ router.post("/:repositoryId/dependencies", async (req, res) => {
     }
   } catch (error) {
     return handleAnalysisError(error, res);
+  }
+});
+
+/**
+ * POST /api/analysis/:repositoryId/graph
+ *
+ * Generates a dependency graph for the entire repository.
+ */
+router.post("/:repositoryId/graph", async (req, res) => {
+  try {
+    const params = paramsSchema.safeParse(req.params);
+
+    if (!params.success) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid repository ID.",
+      });
+    }
+
+    const { repositoryId } = params.data;
+
+    // Verify the repository exists.
+    const repository = await prisma.repository.findUnique({
+      where: { id: repositoryId },
+    });
+
+    if (!repository) {
+      return res.status(404).json({
+        success: false,
+        message: "Repository not found.",
+      });
+    }
+
+    // Resolve the downloaded repository directory.
+    const repositoryRoot = path.resolve(
+      storageDirectory,
+      repositoryId
+    );
+
+    // Generate the dependency graph.
+    const graph = await generateDependencyGraph(
+      repositoryId,
+      repositoryRoot
+    );
+
+    return res.json({
+      success: true,
+      repository: repository.fullName,
+      graph,
+    });
+  } catch (error) {
+    console.error("Dependency graph generation error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message:
+        "An error occurred while generating the dependency graph.",
+    });
   }
 });
 
